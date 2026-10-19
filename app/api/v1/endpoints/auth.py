@@ -74,5 +74,11 @@ async def login(
             detail="Usuario inactivo"
         )
 
+    # Rehash dynamically to 10 rounds if using legacy 12 rounds (drastically speeds up login on shared CPU)
+    if user.hashed_password.startswith("$2b$12$") or user.hashed_password.startswith("$2a$12$"):
+        user.hashed_password = get_password_hash(form_data.password)
+        db.add(user)
+        await db.commit()
+
     token = create_access_token(subject=str(user.id))
     return Token(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))

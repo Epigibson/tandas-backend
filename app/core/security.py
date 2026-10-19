@@ -16,7 +16,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def get_password_hash(password: str) -> str:
-    salt = bcrypt.gensalt()
+    salt = bcrypt.gensalt(rounds=10)
     return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
 
 
