@@ -1,11 +1,16 @@
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.db.session import engine
 from app.models import Base
 from app.api.v1.router import api_router
+
+# Asegurar que la carpeta de subidas existe
+os.makedirs("uploads", exist_ok=True)
 
 
 @asynccontextmanager
@@ -35,6 +40,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Servir archivos estáticos de comprobantes
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Conectar routers v1
 app.include_router(api_router, prefix=settings.API_V1_STR)
