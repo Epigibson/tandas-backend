@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from datetime import datetime, timezone
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.db.session import engine
@@ -39,11 +40,26 @@ app.add_middleware(
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
 
-@app.get("/", tags=["Health"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["Health"])
 async def root():
     return {
         "status": "online",
         "app": settings.PROJECT_NAME,
         "environment": settings.ENVIRONMENT,
-        "docs": "/docs"
+        "docs": "/docs",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["Health"])
+@app.api_route("/ping", methods=["GET", "HEAD"], tags=["Health"])
+async def health_check():
+    """
+    Endpoint ultra-rápido diseñado para UptimeRobot / health checks.
+    Soporta peticiones GET y HEAD devolviendo HTTP 200 OK inmediatamente.
+    """
+    return {
+        "status": "healthy",
+        "ping": "pong",
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
