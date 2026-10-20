@@ -8,6 +8,7 @@ from app.models.round import TandaRound, RoundStatus
 from app.models.tanda import Tanda
 from app.models.user import User
 from app.models.audit import ActivityAuditLog
+from app.models.slot import TandaSlot, PayoutStatus
 
 
 async def process_payment_review(
@@ -37,6 +38,12 @@ async def process_payment_review(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Solo el organizador de la tanda puede revisar comprobantes"
         )
+    # Evita sumar dos veces el mismo pago a lo recaudado
+    if payment.status != PaymentStatus.SUBMITTED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Este comprobante ya fue revisado"
+        )
 
     if approved:
         payment.status = PaymentStatus.APPROVED
@@ -53,6 +60,14 @@ async def process_payment_review(
             tanda_round.collected_amount += payment.amount
             if tanda_round.collected_amount >= tanda_round.expected_amount:
                 tanda_round.status = RoundStatus.COMPLETED_PENDING_PAYOUT
+                # La bolsa del beneficiario queda lista para entregarse
+                slot_stmt = select(TandaSlot).where(
+                    TandaSlot.tanda_id == tanda_round.tanda_id,
+                    TandaSlot.slot_number == tanda_round.slot_number_beneficiary
+                )
+                beneficiary_slot = (await db.execute(slot_stmt)).scalar_one_or_none()
+                if beneficiary_slot:
+                    beneficiary_slot.payout_status = PayoutStatus.READY_TO_PAY
 
         # Mejorar score del usuario por pago puntual
         user_stmt = select(User).where(User.id == payment.payer_user_id)

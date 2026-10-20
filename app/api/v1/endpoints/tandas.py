@@ -10,8 +10,16 @@ from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.tanda import Tanda, TandaStatus
 from app.models.slot import TandaSlot
-from app.schemas.tanda import TandaCreate, TandaResponse, TandaDetailResponse
-from app.services.tanda_service import generate_invite_code, initialize_tanda_slots_and_rounds, execute_lottery_draw
+from app.models.round import RoundStatus
+from app.models.slot import PayoutStatus
+from app.schemas.tanda import TandaCreate, TandaResponse, TandaDetailResponse, TandaSummaryResponse
+from app.services.tanda_service import (
+    generate_invite_code,
+    initialize_tanda_slots_and_rounds,
+    execute_lottery_draw,
+    start_tanda,
+)
+from app.services.tanda_access import ensure_member, ensure_organizer
 
 router = APIRouter()
 
@@ -51,7 +59,7 @@ async def create_tanda(
     return tanda
 
 
-@router.get("", response_model=List[TandaResponse])
+@router.get("", response_model=List[TandaSummaryResponse])
 async def list_my_tandas(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -67,18 +75,33 @@ async def list_my_tandas(
             )
         )
         .distinct()
-        .options(selectinload(Tanda.organizer))
+        .options(
+            selectinload(Tanda.organizer),
+            selectinload(Tanda.slots),
+            selectinload(Tanda.rounds)
+        )
     )
     result = await db.execute(stmt)
-    return result.scalars().all()
+    return [_build_summary(tanda, current_user.id) for tanda in result.scalars().all()]
 
 
-@router.get("/{tanda_id}", response_model=TandaDetailResponse)
-async def get_tanda(
-    tanda_id: UUID,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
+def _build_summary(tanda: Tanda, user_id: UUID) -> TandaSummaryResponse:
+    """Agrega al listado lo que el Home necesita sin pedir el detalle de cada tanda."""
+    collecting = next((r for r in tanda.rounds if r.status == RoundStatus.COLLECTING), None)
+    my_slots = sorted((s for s in tanda.slots if s.user_id == user_id), key=lambda s: s.slot_number)
+    pending_payouts = [
+        s.scheduled_payout_date for s in my_slots
+        if s.payout_status != PayoutStatus.CONFIRMED and s.scheduled_payout_date is not None
+    ]
+
+    summary = TandaSummaryResponse.model_validate(tanda)
+    summary.current_round_number = collecting.round_number if collecting else None
+    summary.my_slot_numbers = [s.slot_number for s in my_slots]
+    summary.my_next_payout_date = min(pending_payouts) if pending_payouts else None
+    return summary
+
+
+async def _load_tanda_detail(db: AsyncSession, tanda_id: UUID) -> Tanda:
     stmt = (
         select(Tanda)
         .where(Tanda.id == tanda_id)
@@ -93,8 +116,33 @@ async def get_tanda(
     
     if not tanda:
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
-    
     return tanda
+
+
+@router.get("/{tanda_id}", response_model=TandaDetailResponse)
+async def get_tanda(
+    tanda_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    tanda = await _load_tanda_detail(db, tanda_id)
+    await ensure_member(db, tanda, current_user.id)
+    return tanda
+
+
+@router.post("/{tanda_id}/start", response_model=TandaDetailResponse)
+async def start_tanda_endpoint(
+    tanda_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """El organizador cierra el reclutamiento y arranca la primera ronda."""
+    tanda = await _load_tanda_detail(db, tanda_id)
+    ensure_organizer(tanda, current_user.id, "Solo el organizador puede iniciar la tanda")
+    await start_tanda(db, tanda, current_user.id)
+    # Recargar desde cero: el commit expira los objetos ya cargados
+    db.expire_all()
+    return await _load_tanda_detail(db, tanda_id)
 
 
 @router.post("/join/{invite_code}", response_model=TandaDetailResponse)
@@ -120,14 +168,20 @@ async def join_tanda_by_invite(
     
     # Si aún no tiene ningún turno y la tanda está en reclutamiento, asignamos el primer slot libre
     already_member = any(slot.user_id == current_user.id for slot in tanda.slots)
-    if not already_member and tanda.organizer_id != current_user.id:
-        empty_slot = next((s for s in tanda.slots if s.user_id is None), None)
-        if empty_slot and tanda.status in ["recruiting", "draft"]:
-            empty_slot.user_id = current_user.id
-            await db.commit()
-            await db.refresh(tanda)
-            
-    return tanda
+    if already_member or tanda.organizer_id == current_user.id:
+        return tanda
+
+    if tanda.status not in (TandaStatus.RECRUITING, TandaStatus.DRAFT):
+        raise HTTPException(status_code=400, detail="Esta tanda ya inició y no acepta nuevos participantes")
+    empty_slot = next((s for s in tanda.slots if s.user_id is None), None)
+    if not empty_slot:
+        raise HTTPException(status_code=400, detail="La tanda ya está llena")
+
+    tanda_id = tanda.id  # leerlo después de expire_all dispararía una carga síncrona
+    empty_slot.user_id = current_user.id
+    await db.commit()
+    db.expire_all()
+    return await _load_tanda_detail(db, tanda_id)
 
 
 @router.post("/{tanda_id}/draw", response_model=TandaDetailResponse)
@@ -142,8 +196,11 @@ async def trigger_lottery_draw(
     
     if not tanda:
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
-    if tanda.organizer_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Solo el organizador puede ejecutar el sorteo de números")
+    ensure_organizer(tanda, current_user.id, "Solo el organizador puede ejecutar el sorteo de números")
+    # Sortear con la tanda en curso revolvería turnos que ya cobraron o están cobrando
+    if tanda.status not in [TandaStatus.RECRUITING, TandaStatus.DRAFT]:
+        raise HTTPException(status_code=400, detail="El sorteo solo se puede hacer antes de iniciar la tanda")
     
     await execute_lottery_draw(db, tanda_id)
-    return await get_tanda(tanda_id=tanda_id, current_user=current_user, db=db)
+    db.expire_all()
+    return await _load_tanda_detail(db, tanda_id)

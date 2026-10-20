@@ -46,6 +46,13 @@ class TandaResponse(TandaBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class TandaSummaryResponse(TandaResponse):
+    """Elemento del listado: incluye el avance y los turnos del usuario que consulta."""
+    current_round_number: Optional[int] = None
+    my_slot_numbers: List[int] = []
+    my_next_payout_date: Optional[datetime] = None
+
+
 class TandaDetailResponse(TandaResponse):
     slots: List[TandaSlotResponse] = []
     rounds: List[TandaRoundResponse] = []

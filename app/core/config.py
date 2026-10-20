@@ -23,6 +23,10 @@ class Settings(BaseSettings):
                 return v.replace("postgres://", "postgresql+asyncpg://", 1)
         return v
 
+    # Supabase Storage (comprobantes). Sin estas variables se guardan en disco local (solo desarrollo)
+    SUPABASE_URL: str = ""
+    SUPABASE_SECRET_KEY: str = ""
+
     # Security
     SECRET_KEY: str = "cambia_esta_clave_secreta_por_una_muy_segura_para_produccion"
     ALGORITHM: str = "HS256"
