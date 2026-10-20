@@ -15,6 +15,7 @@ from app.schemas.payment import PaymentResponse, PaymentSubmitProof, PaymentRevi
 from app.services.payment_service import process_payment_review
 from app.services.tanda_access import count_user_slots, ensure_member
 from app.services import storage_service
+from app.services.realtime_service import notify_tanda_changed
 
 router = APIRouter()
 
@@ -99,6 +100,7 @@ async def submit_payment(
     )
     db.add(payment)
     await db.commit()
+    notify_tanda_changed(tanda.id)
     created = await _load_payment_with_payer(db, payment.id)
     return (await _with_signed_proofs([created]))[0]
 
@@ -141,5 +143,6 @@ async def review_payment(
         approved=review_in.approved,
         rejection_reason=review_in.rejection_reason
     )
+    notify_tanda_changed(payment.tanda_id)
     reviewed = await _load_payment_with_payer(db, payment.id)
     return (await _with_signed_proofs([reviewed]))[0]

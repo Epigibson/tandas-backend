@@ -12,6 +12,7 @@ from app.models.slot import TandaSlot, PayoutStatus
 from app.models.round import TandaRound, RoundStatus
 from app.services.tanda_access import ensure_organizer
 from app.services.tanda_service import close_round_and_advance
+from app.services.realtime_service import notify_tanda_changed
 from app.schemas.slot import TandaSlotResponse
 from app.models.audit import ActivityAuditLog
 
@@ -76,6 +77,7 @@ async def claim_slot(
     db.add(audit)
     
     await db.commit()
+    notify_tanda_changed(slot.tanda_id)
     
     stmt = select(TandaSlot).where(TandaSlot.id == slot_id).options(selectinload(TandaSlot.user))
     res = await db.execute(stmt)
@@ -126,6 +128,7 @@ async def release_slot(
     db.add(audit)
     
     await db.commit()
+    notify_tanda_changed(slot.tanda_id)
     
     stmt = select(TandaSlot).where(TandaSlot.id == slot_id).options(selectinload(TandaSlot.user))
     res = await db.execute(stmt)
@@ -167,6 +170,7 @@ async def assign_user_to_slot(
         description=f"El organizador asignó el Turno #{slot.slot_number} a {target.full_name}."
     ))
     await db.commit()
+    notify_tanda_changed(slot.tanda_id)
     return await _load_slot_with_user(db, slot_id)
 
 
@@ -218,4 +222,5 @@ async def confirm_payout_reception(
     )
     db.add(audit)
     await db.commit()
+    notify_tanda_changed(slot.tanda_id)
     return await _load_slot_with_user(db, slot_id)

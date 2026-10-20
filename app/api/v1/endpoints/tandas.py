@@ -20,6 +20,7 @@ from app.services.tanda_service import (
     start_tanda,
 )
 from app.services.tanda_access import ensure_member, ensure_organizer
+from app.services.realtime_service import notify_tanda_changed
 
 router = APIRouter()
 
@@ -140,6 +141,7 @@ async def start_tanda_endpoint(
     tanda = await _load_tanda_detail(db, tanda_id)
     ensure_organizer(tanda, current_user.id, "Solo el organizador puede iniciar la tanda")
     await start_tanda(db, tanda, current_user.id)
+    notify_tanda_changed(tanda_id)
     # Recargar desde cero: el commit expira los objetos ya cargados
     db.expire_all()
     return await _load_tanda_detail(db, tanda_id)
@@ -180,6 +182,7 @@ async def join_tanda_by_invite(
     tanda_id = tanda.id  # leerlo después de expire_all dispararía una carga síncrona
     empty_slot.user_id = current_user.id
     await db.commit()
+    notify_tanda_changed(tanda_id)
     db.expire_all()
     return await _load_tanda_detail(db, tanda_id)
 
@@ -202,5 +205,6 @@ async def trigger_lottery_draw(
         raise HTTPException(status_code=400, detail="El sorteo solo se puede hacer antes de iniciar la tanda")
     
     await execute_lottery_draw(db, tanda_id)
+    notify_tanda_changed(tanda_id)
     db.expire_all()
     return await _load_tanda_detail(db, tanda_id)
