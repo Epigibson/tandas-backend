@@ -3,21 +3,34 @@ from uuid import UUID
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, delete
 from sqlalchemy.orm import selectinload
 from app.db.session import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.models.tanda import Tanda, TandaStatus
+from app.models.tanda import Tanda, TandaStatus, AssignmentMethod
 from app.models.slot import TandaSlot
 from app.models.round import RoundStatus
 from app.models.slot import PayoutStatus
-from app.schemas.tanda import TandaCreate, TandaResponse, TandaDetailResponse, TandaSummaryResponse
+from app.schemas.tanda import (
+    TandaCreate,
+    TandaUpdate,
+    TandaResponse,
+    TandaDetailResponse,
+    TandaSummaryResponse,
+    JoinTandaRequest,
+    TandaInvitePreview,
+    InviteSlotPreview,
+)
 from app.services.tanda_service import (
     generate_invite_code,
     initialize_tanda_slots_and_rounds,
     execute_lottery_draw,
     start_tanda,
+    ensure_not_started,
+    normalize_start_date,
+    update_tanda_config,
+    assign_on_join,
 )
 from app.services.tanda_access import ensure_member, ensure_organizer, count_user_slots
 from app.services.credentials_service import create_reset_code
@@ -34,7 +47,7 @@ async def create_tanda(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    start_date = tanda_in.start_date or datetime.now(timezone.utc)
+    start_date = normalize_start_date(tanda_in.start_date) if tanda_in.start_date else datetime.now(timezone.utc)
     payout_total = tanda_in.contribution_amount * tanda_in.total_slots
     
     tanda = Tanda(
@@ -150,12 +163,7 @@ async def start_tanda_endpoint(
     return await _load_tanda_detail(db, tanda_id)
 
 
-@router.post("/join/{invite_code}", response_model=TandaDetailResponse)
-async def join_tanda_by_invite(
-    invite_code: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
+async def _load_by_invite(db: AsyncSession, invite_code: str) -> Tanda:
     stmt = (
         select(Tanda)
         .where(Tanda.invite_code == invite_code.upper().strip())
@@ -165,29 +173,100 @@ async def join_tanda_by_invite(
             selectinload(Tanda.rounds)
         )
     )
-    result = await db.execute(stmt)
-    tanda = result.scalar_one_or_none()
-    
+    tanda = (await db.execute(stmt)).scalar_one_or_none()
     if not tanda:
         raise HTTPException(status_code=404, detail="Código de invitación no válido o expirado")
-    
-    # Si aún no tiene ningún turno y la tanda está en reclutamiento, asignamos el primer slot libre
+    return tanda
+
+
+@router.get("/invite/{invite_code}", response_model=TandaInvitePreview)
+async def preview_invite(
+    invite_code: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Muestra la tanda y los números libres antes de unirse, para que cada quien elija el suyo."""
+    tanda = await _load_by_invite(db, invite_code)
+    return TandaInvitePreview(
+        id=tanda.id,
+        title=tanda.title,
+        description=tanda.description,
+        organizer_name=tanda.organizer.full_name,
+        contribution_amount=tanda.contribution_amount,
+        total_slots=tanda.total_slots,
+        payout_total=tanda.payout_total,
+        frequency=tanda.frequency,
+        assignment_method=tanda.assignment_method,
+        status=tanda.status,
+        start_date=tanda.start_date,
+        already_member=tanda.organizer_id == current_user.id
+        or any(s.user_id == current_user.id for s in tanda.slots),
+        slots=[
+            InviteSlotPreview(
+                slot_number=s.slot_number,
+                taken=s.user_id is not None,
+                # Solo el nombre de pila: el código puede llegar a alguien fuera de la familia
+                holder_first_name=s.user.full_name.split(" ")[0] if s.user else None,
+                is_mine=s.user_id == current_user.id,
+                scheduled_payout_date=s.scheduled_payout_date,
+            )
+            for s in tanda.slots
+        ],
+    )
+
+
+@router.post("/join/{invite_code}", response_model=TandaDetailResponse)
+async def join_tanda_by_invite(
+    invite_code: str,
+    join_in: JoinTandaRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    tanda = await _load_by_invite(db, invite_code)
+
     already_member = any(slot.user_id == current_user.id for slot in tanda.slots)
     if already_member or tanda.organizer_id == current_user.id:
         return tanda
 
-    if tanda.status not in (TandaStatus.RECRUITING, TandaStatus.DRAFT):
-        raise HTTPException(status_code=400, detail="Esta tanda ya inició y no acepta nuevos participantes")
-    empty_slot = next((s for s in tanda.slots if s.user_id is None), None)
-    if not empty_slot:
-        raise HTTPException(status_code=400, detail="La tanda ya está llena")
-
+    ensure_not_started(tanda, "Esta tanda ya inició y no acepta nuevos participantes")
     tanda_id = tanda.id  # leerlo después de expire_all dispararía una carga síncrona
-    empty_slot.user_id = current_user.id
-    await db.commit()
+    await assign_on_join(db, tanda, current_user.id, join_in.slot_numbers if join_in else [])
     notify_tanda_changed(tanda_id)
     db.expire_all()
     return await _load_tanda_detail(db, tanda_id)
+
+
+@router.patch("/{tanda_id}", response_model=TandaDetailResponse)
+async def update_tanda(
+    tanda_id: UUID,
+    tanda_in: TandaUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """El organizador cambia la configuración mientras la tanda no inicia."""
+    tanda = await _load_tanda_detail(db, tanda_id)
+    ensure_organizer(tanda, current_user.id, "Solo el organizador puede editar la tanda")
+    await update_tanda_config(db, tanda, tanda_in.model_dump(exclude_unset=True), current_user.id)
+    notify_tanda_changed(tanda_id)
+    db.expire_all()
+    return await _load_tanda_detail(db, tanda_id)
+
+
+@router.delete("/{tanda_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_tanda(
+    tanda_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Borra una tanda que no ha iniciado; turnos, rondas y bitácora se van en cascada en la BD."""
+    tanda = (await db.execute(select(Tanda).where(Tanda.id == tanda_id))).scalar_one_or_none()
+    if not tanda:
+        raise HTTPException(status_code=404, detail="Tanda no encontrada")
+    ensure_organizer(tanda, current_user.id, "Solo el organizador puede eliminar la tanda")
+    ensure_not_started(tanda, "Solo se puede eliminar una tanda que aún no inicia")
+    await db.execute(delete(Tanda).where(Tanda.id == tanda_id))
+    await db.commit()
+    notify_tanda_changed(tanda_id)
 
 
 @router.post("/{tanda_id}/draw", response_model=TandaDetailResponse)
@@ -204,8 +283,9 @@ async def trigger_lottery_draw(
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
     ensure_organizer(tanda, current_user.id, "Solo el organizador puede ejecutar el sorteo de números")
     # Sortear con la tanda en curso revolvería turnos que ya cobraron o están cobrando
-    if tanda.status not in [TandaStatus.RECRUITING, TandaStatus.DRAFT]:
-        raise HTTPException(status_code=400, detail="El sorteo solo se puede hacer antes de iniciar la tanda")
+    ensure_not_started(tanda, "El sorteo solo se puede hacer antes de iniciar la tanda")
+    if tanda.assignment_method == AssignmentMethod.FIRST_COME:
+        raise HTTPException(status_code=400, detail="En elección libre cada quien escoge su número; no hay sorteo")
     
     await execute_lottery_draw(db, tanda_id)
     notify_tanda_changed(tanda_id)
