@@ -3,10 +3,20 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from app.db.session import get_db
+from uuid import UUID
+from app.api.deps import get_current_user
 from app.core.security import verify_password, get_password_hash, create_access_token
 from app.models.user import User
 from app.schemas.user import UserCreate, UserResponse
-from app.schemas.auth import Token, LoginRequest
+from app.schemas.auth import (
+    Token,
+    LoginRequest,
+    DeviceRegisterRequest,
+    DeviceRegisterResponse,
+    DeviceLoginRequest,
+    PasswordResetRequest,
+)
+from app.services import credentials_service
 
 router = APIRouter()
 
@@ -82,3 +92,53 @@ async def login(
 
     token = create_access_token(subject=str(user.id))
     return Token(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
+
+
+def _token_for(user: User) -> Token:
+    return Token(
+        access_token=create_access_token(subject=str(user.id)),
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+    )
+
+
+@router.post("/devices", response_model=DeviceRegisterResponse, status_code=status.HTTP_201_CREATED)
+async def register_device(
+    payload: DeviceRegisterRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Activa "Entrar con huella" en un teléfono. El secreto se entrega una sola vez;
+    el teléfono lo guarda en su almacenamiento seguro y aquí solo queda su hash.
+    """
+    credential, secret = await credentials_service.create_device_credential(db, current_user, payload.device_name)
+    return DeviceRegisterResponse(device_id=credential.id, device_secret=secret)
+
+
+@router.post("/device-login", response_model=Token)
+async def device_login(payload: DeviceLoginRequest, db: AsyncSession = Depends(get_db)):
+    """Inicio de sesión con la llave del teléfono (la app la libera solo tras validar la huella)."""
+    user = await credentials_service.authenticate_device(db, payload.device_id, payload.device_secret)
+    return _token_for(user)
+
+
+@router.delete("/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_device(
+    device_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await credentials_service.revoke_device_credential(db, device_id, current_user.id)
+
+
+@router.post("/reset-password", response_model=Token)
+async def reset_password(payload: PasswordResetRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Cambia la contraseña con el código que generó el organizador de una tanda
+    y deja la sesión iniciada. Revoca la huella de todos los teléfonos del usuario.
+    """
+    user = await credentials_service.reset_password_with_code(
+        db, payload.phone_or_email, payload.code, payload.new_password
+    )
+    return _token_for(user)

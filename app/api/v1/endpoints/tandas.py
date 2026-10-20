@@ -19,7 +19,10 @@ from app.services.tanda_service import (
     execute_lottery_draw,
     start_tanda,
 )
-from app.services.tanda_access import ensure_member, ensure_organizer
+from app.services.tanda_access import ensure_member, ensure_organizer, count_user_slots
+from app.services.credentials_service import create_reset_code
+from app.models.audit import ActivityAuditLog
+from app.schemas.auth import ResetCodeResponse
 from app.services.realtime_service import notify_tanda_changed
 
 router = APIRouter()
@@ -208,3 +211,34 @@ async def trigger_lottery_draw(
     notify_tanda_changed(tanda_id)
     db.expire_all()
     return await _load_tanda_detail(db, tanda_id)
+
+
+@router.post("/{tanda_id}/members/{user_id}/reset-code", response_model=ResetCodeResponse)
+async def create_member_reset_code(
+    tanda_id: UUID,
+    user_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    El organizador genera un código temporal (30 min) para que un miembro de su tanda
+    que olvidó su contraseña pueda cambiarla desde el login.
+    """
+    tanda = (await db.execute(select(Tanda).where(Tanda.id == tanda_id))).scalar_one_or_none()
+    if not tanda:
+        raise HTTPException(status_code=404, detail="Tanda no encontrada")
+    ensure_organizer(tanda, current_user.id, "Solo el organizador puede generar códigos para restablecer contraseña")
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Para cambiar tu propia contraseña no necesitas un código")
+    if await count_user_slots(db, tanda_id, user_id) == 0:
+        raise HTTPException(status_code=404, detail="Esa persona no participa en esta tanda")
+
+    code, expires_at = await create_reset_code(db, user_id, current_user.id)
+    db.add(ActivityAuditLog(
+        tanda_id=tanda_id,
+        user_id=current_user.id,
+        action="RESET_CODE_CREATED",
+        description="El organizador generó un código para restablecer la contraseña de un participante.",
+    ))
+    await db.commit()
+    return ResetCodeResponse(code=code, expires_at=expires_at)
