@@ -13,7 +13,8 @@ from app.models.round import TandaRound, RoundStatus
 from app.models.tanda import Tanda, TandaStatus
 from app.schemas.payment import PaymentResponse, PaymentSubmitProof, PaymentReview
 from app.services.payment_service import process_payment_review
-from app.services.tanda_access import count_user_slots, ensure_member
+from app.services.tanda_access import count_user_slots, ensure_member, can_manage
+from app.models.audit import ActivityAuditLog
 from app.services import storage_service
 from app.services.realtime_service import notify_tanda_changed
 
@@ -68,7 +69,11 @@ async def submit_payment(
     if not tanda:
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
 
-    my_slots = await count_user_slots(db, tanda.id, current_user.id)
+    payer_id = payload.payer_user_id or current_user.id
+    on_behalf = payer_id != current_user.id
+    if on_behalf and not can_manage(tanda, current_user):
+        raise HTTPException(status_code=403, detail="Solo el organizador puede registrar aportaciones de otros")
+    my_slots = await count_user_slots(db, tanda.id, payer_id)
     if my_slots == 0:
         raise HTTPException(status_code=403, detail="Solo los participantes con número pueden aportar")
     if tanda.status != TandaStatus.ACTIVE:
@@ -81,16 +86,19 @@ async def submit_payment(
 
     existing_stmt = select(Payment.id).where(
         Payment.round_id == tanda_round.id,
-        Payment.payer_user_id == current_user.id,
+        Payment.payer_user_id == payer_id,
         Payment.status.in_([PaymentStatus.SUBMITTED, PaymentStatus.APPROVED])
     ).limit(1)
     if (await db.execute(existing_stmt)).scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Ya enviaste tu aportación de esta ronda")
+        raise HTTPException(
+            status_code=400,
+            detail="Esa persona ya tiene su aportación de esta ronda" if on_behalf else "Ya enviaste tu aportación de esta ronda"
+        )
 
     payment = Payment(
         tanda_id=tanda.id,
         round_id=tanda_round.id,
-        payer_user_id=current_user.id,
+        payer_user_id=payer_id,
         slot_number=tanda_round.slot_number_beneficiary,
         # Un solo comprobante cubre todos los números que tenga el participante
         amount=tanda.contribution_amount * my_slots,
@@ -99,6 +107,13 @@ async def submit_payment(
         proof_image_url=payload.proof_image_url
     )
     db.add(payment)
+    if on_behalf:
+        db.add(ActivityAuditLog(
+            tanda_id=tanda.id,
+            user_id=current_user.id,
+            action="PAYMENT_SUBMITTED_ON_BEHALF",
+            description=f"{current_user.full_name} registró una aportación a nombre de otro participante."
+        ))
     await db.commit()
     notify_tanda_changed(tanda.id)
     created = await _load_payment_with_payer(db, payment.id)
@@ -114,7 +129,7 @@ async def list_payments_for_tanda(
     tanda = (await db.execute(select(Tanda).where(Tanda.id == tanda_id))).scalar_one_or_none()
     if not tanda:
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
-    await ensure_member(db, tanda, current_user.id)
+    await ensure_member(db, tanda, current_user)
 
     stmt = (
         select(Payment)
@@ -139,7 +154,7 @@ async def review_payment(
     payment = await process_payment_review(
         db=db,
         payment_id=payment_id,
-        reviewer_user_id=current_user.id,
+        reviewer=current_user,
         approved=review_in.approved,
         rejection_reason=review_in.rejection_reason
     )

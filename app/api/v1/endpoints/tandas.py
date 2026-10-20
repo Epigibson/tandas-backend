@@ -32,7 +32,7 @@ from app.services.tanda_service import (
     update_tanda_config,
     assign_on_join,
 )
-from app.services.tanda_access import ensure_member, ensure_organizer, count_user_slots
+from app.services.tanda_access import ensure_member, ensure_organizer, ensure_superuser, count_user_slots
 from app.services.credentials_service import create_reset_code
 from app.models.audit import ActivityAuditLog
 from app.schemas.auth import ResetCodeResponse
@@ -78,21 +78,27 @@ async def create_tanda(
 
 @router.get("", response_model=List[TandaSummaryResponse])
 async def list_my_tandas(
+    all_tandas: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    # Tandas donde soy organizador O donde tengo un slot asignado
-    stmt = (
-        select(Tanda)
-        .outerjoin(TandaSlot, Tanda.id == TandaSlot.tanda_id)
-        .where(
-            or_(
-                Tanda.organizer_id == current_user.id,
-                TandaSlot.user_id == current_user.id
+    # Tandas donde soy organizador O donde tengo un slot asignado; el admin puede pedir todas
+    stmt = select(Tanda)
+    if all_tandas:
+        ensure_superuser(current_user)
+    else:
+        stmt = (
+            stmt.outerjoin(TandaSlot, Tanda.id == TandaSlot.tanda_id)
+            .where(
+                or_(
+                    Tanda.organizer_id == current_user.id,
+                    TandaSlot.user_id == current_user.id
+                )
             )
+            .distinct()
         )
-        .distinct()
-        .options(
+    stmt = (
+        stmt.options(
             selectinload(Tanda.organizer),
             selectinload(Tanda.slots),
             selectinload(Tanda.rounds)
@@ -143,7 +149,7 @@ async def get_tanda(
     db: AsyncSession = Depends(get_db)
 ):
     tanda = await _load_tanda_detail(db, tanda_id)
-    await ensure_member(db, tanda, current_user.id)
+    await ensure_member(db, tanda, current_user)
     return tanda
 
 
@@ -155,7 +161,7 @@ async def start_tanda_endpoint(
 ):
     """El organizador cierra el reclutamiento y arranca la primera ronda."""
     tanda = await _load_tanda_detail(db, tanda_id)
-    ensure_organizer(tanda, current_user.id, "Solo el organizador puede iniciar la tanda")
+    ensure_organizer(tanda, current_user, "Solo el organizador puede iniciar la tanda")
     await start_tanda(db, tanda, current_user.id)
     notify_tanda_changed(tanda_id)
     # Recargar desde cero: el commit expira los objetos ya cargados
@@ -245,7 +251,7 @@ async def update_tanda(
 ):
     """El organizador cambia la configuración mientras la tanda no inicia."""
     tanda = await _load_tanda_detail(db, tanda_id)
-    ensure_organizer(tanda, current_user.id, "Solo el organizador puede editar la tanda")
+    ensure_organizer(tanda, current_user, "Solo el organizador puede editar la tanda")
     await update_tanda_config(db, tanda, tanda_in.model_dump(exclude_unset=True), current_user.id)
     notify_tanda_changed(tanda_id)
     db.expire_all()
@@ -262,7 +268,7 @@ async def delete_tanda(
     tanda = (await db.execute(select(Tanda).where(Tanda.id == tanda_id))).scalar_one_or_none()
     if not tanda:
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
-    ensure_organizer(tanda, current_user.id, "Solo el organizador puede eliminar la tanda")
+    ensure_organizer(tanda, current_user, "Solo el organizador puede eliminar la tanda")
     ensure_not_started(tanda, "Solo se puede eliminar una tanda que aún no inicia")
     await db.execute(delete(Tanda).where(Tanda.id == tanda_id))
     await db.commit()
@@ -281,7 +287,7 @@ async def trigger_lottery_draw(
     
     if not tanda:
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
-    ensure_organizer(tanda, current_user.id, "Solo el organizador puede ejecutar el sorteo de números")
+    ensure_organizer(tanda, current_user, "Solo el organizador puede ejecutar el sorteo de números")
     # Sortear con la tanda en curso revolvería turnos que ya cobraron o están cobrando
     ensure_not_started(tanda, "El sorteo solo se puede hacer antes de iniciar la tanda")
     if tanda.assignment_method == AssignmentMethod.FIRST_COME:
@@ -307,10 +313,10 @@ async def create_member_reset_code(
     tanda = (await db.execute(select(Tanda).where(Tanda.id == tanda_id))).scalar_one_or_none()
     if not tanda:
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
-    ensure_organizer(tanda, current_user.id, "Solo el organizador puede generar códigos para restablecer contraseña")
+    ensure_organizer(tanda, current_user, "Solo el organizador puede generar códigos para restablecer contraseña")
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Para cambiar tu propia contraseña no necesitas un código")
-    if await count_user_slots(db, tanda_id, user_id) == 0:
+    if not current_user.is_superuser and await count_user_slots(db, tanda_id, user_id) == 0:
         raise HTTPException(status_code=404, detail="Esa persona no participa en esta tanda")
 
     code, expires_at = await create_reset_code(db, user_id, current_user.id)

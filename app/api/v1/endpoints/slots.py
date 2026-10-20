@@ -10,7 +10,7 @@ from app.models.user import User
 from app.models.tanda import Tanda, TandaStatus
 from app.models.slot import TandaSlot, PayoutStatus
 from app.models.round import TandaRound, RoundStatus
-from app.services.tanda_access import ensure_organizer
+from app.services.tanda_access import ensure_organizer, can_manage
 from app.services.tanda_service import close_round_and_advance
 from app.services.realtime_service import notify_tanda_changed
 from app.schemas.slot import TandaSlotResponse
@@ -114,7 +114,7 @@ async def release_slot(
             detail="No se pueden liberar turnos una vez iniciada la tanda"
         )
         
-    if slot.user_id != current_user.id and tanda.organizer_id != current_user.id:
+    if slot.user_id != current_user.id and not can_manage(tanda, current_user):
         raise HTTPException(status_code=403, detail="Solo el titular del turno o el organizador pueden liberarlo")
         
     slot.user_id = None
@@ -154,7 +154,7 @@ async def assign_user_to_slot(
     
     if not tanda:
         raise HTTPException(status_code=404, detail="Tanda no encontrada")
-    ensure_organizer(tanda, current_user.id, "Solo el organizador puede asignar turnos manualmente")
+    ensure_organizer(tanda, current_user, "Solo el organizador puede asignar turnos manualmente")
     if tanda.status not in (TandaStatus.RECRUITING, TandaStatus.DRAFT):
         raise HTTPException(status_code=400, detail="No se pueden reasignar turnos una vez iniciada la tanda")
 
@@ -182,19 +182,25 @@ async def confirm_payout_reception(
 ):
     """
     El beneficiario del turno confirma formalmente que ya recibió el dinero del pozo.
+    El organizador (o el admin) puede confirmarlo por quien no use la app.
     """
-    stmt = select(TandaSlot).where(TandaSlot.id == slot_id)
+    stmt = select(TandaSlot).where(TandaSlot.id == slot_id).options(selectinload(TandaSlot.user))
     res = await db.execute(stmt)
     slot = res.scalar_one_or_none()
     
     if not slot:
         raise HTTPException(status_code=404, detail="Turno no encontrado")
-    
+
+    on_behalf = False
     if slot.user_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="Solo el beneficiario asignado a este turno puede confirmar la recepción del dinero"
-        )
+        tanda = (await db.execute(select(Tanda).where(Tanda.id == slot.tanda_id))).scalar_one()
+        if slot.user_id is None or not can_manage(tanda, current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Solo el beneficiario asignado a este turno puede confirmar la recepción del dinero"
+            )
+        on_behalf = True
+    beneficiary_name = slot.user.full_name
 
     if slot.payout_status == PayoutStatus.CONFIRMED:
         raise HTTPException(status_code=400, detail="Ya habías confirmado la recepción de esta bolsa")
@@ -218,7 +224,11 @@ async def confirm_payout_reception(
         tanda_id=slot.tanda_id,
         user_id=current_user.id,
         action="PAYOUT_CONFIRMED",
-        description=f"{current_user.full_name} confirmó la recepción del pozo del Turno #{slot.slot_number}."
+        description=(
+            f"{current_user.full_name} confirmó que {beneficiary_name} recibió el pozo del Turno #{slot.slot_number}."
+            if on_behalf
+            else f"{current_user.full_name} confirmó la recepción del pozo del Turno #{slot.slot_number}."
+        )
     )
     db.add(audit)
     await db.commit()

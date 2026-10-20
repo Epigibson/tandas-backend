@@ -9,12 +9,13 @@ from app.models.tanda import Tanda
 from app.models.user import User
 from app.models.audit import ActivityAuditLog
 from app.models.slot import TandaSlot, PayoutStatus
+from app.services.tanda_access import can_manage
 
 
 async def process_payment_review(
     db: AsyncSession,
     payment_id: UUID,
-    reviewer_user_id: UUID,
+    reviewer: User,
     approved: bool,
     rejection_reason: str = None
 ) -> Payment:
@@ -33,7 +34,8 @@ async def process_payment_review(
     tanda_res = await db.execute(tanda_stmt)
     tanda = tanda_res.scalar_one_or_none()
     
-    if not tanda or tanda.organizer_id != reviewer_user_id:
+    reviewer_user_id = reviewer.id
+    if not tanda or not can_manage(tanda, reviewer):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Solo el organizador de la tanda puede revisar comprobantes"

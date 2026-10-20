@@ -13,6 +13,8 @@ class PaymentBase(BaseModel):
 
 class PaymentSubmitProof(BaseModel):
     proof_image_url: str
+    # El organizador (o el admin) puede registrar la aportación de alguien que no usa la app
+    payer_user_id: Optional[UUID] = None
 
 
 class PaymentReview(BaseModel):
