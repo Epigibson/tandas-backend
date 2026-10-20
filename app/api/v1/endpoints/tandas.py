@@ -118,22 +118,15 @@ async def join_tanda_by_invite(
     if not tanda:
         raise HTTPException(status_code=404, detail="Código de invitación no válido o expirado")
     
-    # Verificar si el usuario ya está en la tanda
+    # Si aún no tiene ningún turno y la tanda está en reclutamiento, asignamos el primer slot libre
     already_member = any(slot.user_id == current_user.id for slot in tanda.slots)
-    if already_member or tanda.organizer_id == current_user.id:
-        return tanda
-
-    # Asignar primer slot libre si está disponible
-    empty_slot = next((s for s in tanda.slots if s.user_id is None), None)
-    if not empty_slot:
-        raise HTTPException(
-            status_code=400,
-            detail="La tanda ya tiene todos los turnos ocupados"
-        )
-    
-    empty_slot.user_id = current_user.id
-    await db.commit()
-    await db.refresh(tanda)
+    if not already_member and tanda.organizer_id != current_user.id:
+        empty_slot = next((s for s in tanda.slots if s.user_id is None), None)
+        if empty_slot and tanda.status in ["recruiting", "draft"]:
+            empty_slot.user_id = current_user.id
+            await db.commit()
+            await db.refresh(tanda)
+            
     return tanda
 
 
