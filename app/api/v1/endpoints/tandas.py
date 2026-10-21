@@ -8,7 +8,7 @@ from sqlalchemy.orm import selectinload
 from app.db.session import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.models.tanda import Tanda, TandaStatus, AssignmentMethod
+from app.models.tanda import Tanda, TandaStatus
 from app.models.slot import TandaSlot
 from app.models.round import RoundStatus
 from app.models.slot import PayoutStatus
@@ -290,10 +290,7 @@ async def trigger_lottery_draw(
     ensure_organizer(tanda, current_user, "Solo el organizador puede ejecutar el sorteo de números")
     # Sortear con la tanda en curso revolvería turnos que ya cobraron o están cobrando
     ensure_not_started(tanda, "El sorteo solo se puede hacer antes de iniciar la tanda")
-    if tanda.assignment_method == AssignmentMethod.FIRST_COME:
-        raise HTTPException(status_code=400, detail="En elección libre cada quien escoge su número; no hay sorteo")
-    
-    await execute_lottery_draw(db, tanda_id)
+    await execute_lottery_draw(db, tanda, current_user.id)
     notify_tanda_changed(tanda_id)
     db.expire_all()
     return await _load_tanda_detail(db, tanda_id)

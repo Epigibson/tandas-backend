@@ -1,6 +1,5 @@
 import calendar
 import secrets
-import random
 from datetime import datetime, timedelta, timezone
 from typing import List
 from uuid import UUID
@@ -106,6 +105,10 @@ async def update_tanda_config(db: AsyncSession, tanda: Tanda, changes: dict, use
             setattr(tanda, field, changes[field])
 
     new_total = changes.get("total_slots")
+    method_changed = "assignment_method" in changes  # ya se aplicó arriba
+    if method_changed or (new_total is not None and new_total != tanda.total_slots):
+        # Con otros lugares u otra forma de asignar, el sorteo anterior ya no vale
+        tanda.numbers_drawn_at = None
     if new_total is not None and new_total != tanda.total_slots:
         if new_total < tanda.total_slots:
             taken = sorted(s.slot_number for s in tanda.slots if s.slot_number > new_total and s.user_id is not None)
@@ -203,7 +206,9 @@ async def initialize_tanda_slots_and_rounds(
         slot = TandaSlot(
             tanda_id=tanda.id,
             slot_number=i,
-            user_id=tanda.organizer_id if i == 1 else None, # Por tradición mexicana, el organizador suele tomar el número 1
+            # En sorteo el organizador ya ocupa un lugar (su número sale en el sorteo);
+            # en elección libre escoge su número como todos
+            user_id=tanda.organizer_id if i == 1 and tanda.assignment_method != AssignmentMethod.FIRST_COME else None,
             scheduled_payout_date=dates[i - 1],
             payout_status=PayoutStatus.PENDING
         )
@@ -234,29 +239,39 @@ async def initialize_tanda_slots_and_rounds(
     await db.commit()
 
 
-async def execute_lottery_draw(
-    db: AsyncSession,
-    tanda_id: UUID
-) -> List[TandaSlot]:
+async def execute_lottery_draw(db: AsyncSession, tanda: Tanda, user_id: UUID) -> None:
     """
-    Sortea aleatoriamente los miembros asignados a una tanda entre los turnos disponibles.
+    Reparte los números al azar entre los lugares apartados. Solo con la tanda llena y una sola vez
+    (se vuelve a permitir si cambian los lugares al editar la tanda).
     """
-    stmt = select(TandaSlot).where(TandaSlot.tanda_id == tanda_id).order_by(TandaSlot.slot_number)
-    res = await db.execute(stmt)
-    slots = list(res.scalars().all())
+    if tanda.assignment_method != AssignmentMethod.DRAW:
+        raise HTTPException(status_code=400, detail="En elección libre cada quien escoge su número; no hay sorteo")
+    if tanda.numbers_drawn_at is not None:
+        raise HTTPException(status_code=400, detail="El sorteo ya se hizo")
 
-    # Obtenemos todos los user_id asignados
-    user_ids = [slot.user_id for slot in slots if slot.user_id is not None]
-    
-    # Barajamos aleatoriamente
-    random.shuffle(user_ids)
+    stmt = select(TandaSlot).where(TandaSlot.tanda_id == tanda.id).order_by(TandaSlot.slot_number)
+    slots = list((await db.execute(stmt)).scalars().all())
+    empty = sum(1 for slot in slots if slot.user_id is None)
+    if empty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Faltan {empty} {'lugar' if empty == 1 else 'lugares'} por llenar antes del sorteo"
+        )
 
-    # Reasignamos
-    for i, user_id in enumerate(user_ids):
-        slots[i].user_id = user_id
+    user_ids = [slot.user_id for slot in slots]
+    # SystemRandom: el orden no se puede predecir a partir de sorteos anteriores
+    secrets.SystemRandom().shuffle(user_ids)
+    for slot, new_user_id in zip(slots, user_ids):
+        slot.user_id = new_user_id
 
+    tanda.numbers_drawn_at = datetime.now(timezone.utc)
+    db.add(ActivityAuditLog(
+        tanda_id=tanda.id,
+        user_id=user_id,
+        action="LOTTERY_DRAW",
+        description=f"Se sortearon los {len(slots)} números de la tanda '{tanda.title}'."
+    ))
     await db.commit()
-    return slots
 
 
 async def start_tanda(db: AsyncSession, tanda: Tanda, user_id: UUID) -> None:
@@ -265,6 +280,11 @@ async def start_tanda(db: AsyncSession, tanda: Tanda, user_id: UUID) -> None:
     Las fechas se recalculan desde hoy (o desde la fecha de inicio pactada, si es futura).
     """
     ensure_not_started(tanda, "La tanda ya fue iniciada")
+    if tanda.assignment_method == AssignmentMethod.DRAW and tanda.numbers_drawn_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Primero haz el sorteo de números"
+        )
 
     empty_slots = sum(1 for s in tanda.slots if s.user_id is None)
     if empty_slots:

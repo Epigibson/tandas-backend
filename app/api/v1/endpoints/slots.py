@@ -2,18 +2,18 @@ from uuid import UUID
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 from app.db.session import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.models.tanda import Tanda, TandaStatus
+from app.models.tanda import Tanda, TandaStatus, AssignmentMethod
 from app.models.slot import TandaSlot, PayoutStatus
 from app.models.round import TandaRound, RoundStatus
 from app.services.tanda_access import ensure_organizer, can_manage
 from app.services.tanda_service import close_round_and_advance
 from app.services.realtime_service import notify_tanda_changed
-from app.schemas.slot import TandaSlotResponse
+from app.schemas.slot import TandaSlotResponse, SlotMoveRequest
 from app.models.audit import ActivityAuditLog
 
 router = APIRouter()
@@ -133,6 +133,60 @@ async def release_slot(
     stmt = select(TandaSlot).where(TandaSlot.id == slot_id).options(selectinload(TandaSlot.user))
     res = await db.execute(stmt)
     return res.scalar_one()
+
+
+@router.post("/{slot_id}/move", response_model=TandaSlotResponse)
+async def move_to_number(
+    slot_id: UUID,
+    move_in: SlotMoveRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    En elección libre: cambia a su dueño de su número a otro libre en un solo paso,
+    sin tener que liberar primero (y sin que nadie le gane el número en medio).
+    """
+    slot = (await db.execute(select(TandaSlot).where(TandaSlot.id == slot_id))).scalar_one_or_none()
+    if not slot or slot.user_id is None:
+        raise HTTPException(status_code=404, detail="Turno no encontrado")
+    tanda = (await db.execute(select(Tanda).where(Tanda.id == slot.tanda_id))).scalar_one()
+    if slot.user_id != current_user.id and not can_manage(tanda, current_user):
+        raise HTTPException(status_code=403, detail="Solo puedes cambiar tu propio número")
+    if tanda.status not in (TandaStatus.RECRUITING, TandaStatus.DRAFT):
+        raise HTTPException(status_code=400, detail="Ya no se pueden cambiar números: la tanda inició")
+    if tanda.assignment_method != AssignmentMethod.FIRST_COME:
+        raise HTTPException(status_code=400, detail="En sorteo los números los reparte el sorteo")
+    if move_in.slot_number == slot.slot_number:
+        raise HTTPException(status_code=400, detail="Ya tienes ese número")
+
+    owner_id = slot.user_id
+    result = await db.execute(
+        update(TandaSlot)
+        .where(
+            TandaSlot.tanda_id == tanda.id,
+            TandaSlot.slot_number == move_in.slot_number,
+            TandaSlot.user_id.is_(None),
+        )
+        .values(user_id=owner_id)
+        .returning(TandaSlot.id)
+        .execution_options(synchronize_session=False)
+    )
+    target_id = result.scalar_one_or_none()
+    if target_id is None:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=f"El #{move_in.slot_number} ya no está libre. Elige otro.")
+
+    old_number = slot.slot_number
+    slot.user_id = None
+    db.add(ActivityAuditLog(
+        tanda_id=tanda.id,
+        user_id=current_user.id,
+        action="MOVE_SLOT",
+        description=f"Cambio de número: del #{old_number} al #{move_in.slot_number}."
+    ))
+    await db.commit()
+    notify_tanda_changed(tanda.id)
+    return await _load_slot_with_user(db, target_id)
 
 
 @router.put("/{slot_id}/assign-user", response_model=TandaSlotResponse)

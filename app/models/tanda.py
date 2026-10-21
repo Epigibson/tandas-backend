@@ -78,6 +78,8 @@ class Tanda(Base, TimestampMixin):
     
     start_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     end_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # En sorteo los números se mantienen ocultos hasta que esto tenga fecha
+    numbers_drawn_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Relaciones
     organizer = relationship("User", back_populates="organized_tandas", foreign_keys=[organizer_id])

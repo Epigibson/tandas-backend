@@ -74,6 +74,7 @@ class TandaResponse(TandaBase):
     status: TandaStatus
     invite_code: str
     created_at: datetime
+    numbers_drawn_at: Optional[datetime] = None
     organizer: Optional[UserResponse] = None
 
     model_config = ConfigDict(from_attributes=True)
